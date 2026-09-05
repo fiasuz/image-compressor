@@ -1,0 +1,9 @@
+/imgcompress
+/imgcompress.exe
+/bin/
+/dist/
+/coverage.out
+*.test
+.DS_Store
+.idea/
+.vscode/

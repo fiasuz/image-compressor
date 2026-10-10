@@ -142,13 +142,48 @@ returns a paletted image. Unlike the CLI, `Options{}` selects **manual lossy**
 compression. Use `Options{Smart: true}` for automatic quality selection or
 `Options{Lossless: true}` for pixel preservation. Set only one of these modes.
 
+## HTTP server
+
+`cmd/imgcompress-server` serves the same compressor over HTTP for web clients.
+
+```sh
+go run ./cmd/imgcompress-server -origin https://your-app.vercel.app
+# or
+docker build -t imgcompress-server .
+docker run -p 8080:8080 imgcompress-server -origin https://your-app.vercel.app
+```
+
+`POST /api/compress` takes `multipart/form-data` with an `image` file and
+optional `mode` (`smart`, `lossless`, or `lossy`), `min_psnr`, `colors`,
+`dither`, and `quality` fields, matching the CLI flags and defaults. The
+response body is the compressed image in its input format. Errors are plain text
+with status 400 (invalid settings), 413 (file or pixel limit), 415 (not a PNG,
+JPEG, or GIF), or 422 (decoding failed). `GET /api/limits` returns the upload
+limits as JSON, and `GET /healthz` returns `ok`.
+
+| Flag              | Default    | Meaning                                         |
+| ----------------- | ---------- | ----------------------------------------------- |
+| `-addr`           | `:8080`    | Listen address                                  |
+| `-origin`         | `*`        | Allowed CORS origins, comma-separated           |
+| `-max-mb`         | `10`       | Maximum upload size in MB                       |
+| `-max-megapixels` | `16`       | Maximum image size in megapixels                |
+| `-workers`        | CPU count  | Maximum concurrent compressions; others wait    |
+
+Uploads are processed in memory and never written to disk. Serve it behind a
+TLS-terminating reverse proxy such as Caddy or nginx, since browsers block
+HTTPS pages from calling a plain-HTTP API; with nginx, raise
+`client_max_body_size` above `-max-mb`. Smart mode can take about a minute on
+large photos on a single core, so keep proxy read timeouts generous (300 s).
+
 ## Limitations
 
 - WebP, AVIF, format conversion, resizing, and batch processing are not supported.
 - Re-encoding does not preserve metadata such as EXIF or ICC profiles. Original
   bytes retained by the fallback keep their metadata.
 - Animated PNG is not preserved when re-encoded; use static PNG inputs.
-- Smart mode performs multiple compression attempts and can be slow on large images.
+- Smart mode performs multiple compression attempts, spread across CPU cores, and
+  is slower than the manual modes; most of its time goes to maximum-compression
+  PNG encoding of each candidate.
 - Inputs and decoded images are held in memory with no built-in resource limits.
 
 ## Development

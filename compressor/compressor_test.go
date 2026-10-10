@@ -215,6 +215,88 @@ func TestInvalidColorCount(t *testing.T) {
 	}
 }
 
+func TestPaletteSearchMatchesLinearScan(t *testing.T) {
+	seed := uint32(1)
+	next := func() uint8 {
+		seed = seed*1664525 + 1013904223
+		return uint8(seed >> 24)
+	}
+	for _, size := range []int{1, 2, 7, 16, 255, 256} {
+		palette := make([]color.NRGBA, size)
+		for i := range palette {
+			palette[i] = color.NRGBA{R: next(), G: next(), B: next(), A: next()}
+		}
+		if size > 2 {
+			// Duplicate entries force ties, which must resolve to the lowest index.
+			palette[size-1], palette[size/2] = palette[0], palette[1]
+		}
+		search := newPaletteSearch(palette)
+		for n := 0; n < 5000; n++ {
+			r, g, b, a := next(), next(), next(), next()
+			if n%5 == 0 {
+				c := palette[int(r)%size]
+				r, g, b, a = c.R, c.G, c.B, c.A
+			}
+			want, best := 0, 1<<62
+			for i, c := range palette {
+				dr, dg, db, da := int(r)-int(c.R), int(g)-int(c.G), int(b)-int(c.B), int(a)-int(c.A)
+				if d := dr*dr + dg*dg + db*db + 2*da*da; d < best {
+					want, best = i, d
+				}
+			}
+			if got := search.nearest(r, g, b, a); int(got) != want {
+				t.Fatalf("palette %d, color %v: got index %d, want %d", size, color.NRGBA{r, g, b, a}, got, want)
+			}
+		}
+	}
+}
+
+func TestReferencePixelsMatchNRGBAModel(t *testing.T) {
+	rect := image.Rect(3, 5, 19, 14)
+	seed := uint32(7)
+	next := func() uint8 {
+		seed = seed*1664525 + 1013904223
+		return uint8(seed >> 24)
+	}
+	rgba := image.NewRGBA(rect)
+	nrgba := image.NewNRGBA(rect)
+	gray := image.NewGray(rect)
+	nrgba64 := image.NewNRGBA64(rect)
+	ycbcr := image.NewYCbCr(rect, image.YCbCrSubsampleRatio420)
+	paletted := image.NewPaletted(rect, color.Palette{
+		color.NRGBA{R: 200, G: 10, B: 90, A: 128}, color.RGBA{R: 40, G: 40, B: 40, A: 255}, color.NRGBA{},
+	})
+	for i := range ycbcr.Y {
+		ycbcr.Y[i] = next()
+	}
+	for i := range ycbcr.Cb {
+		ycbcr.Cb[i], ycbcr.Cr[i] = next(), next()
+	}
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			a := next()
+			rgba.SetRGBA(x, y, color.RGBA{R: next() % (a + 1), G: next() % (a + 1), B: next() % (a + 1), A: a})
+			nrgba.SetNRGBA(x, y, color.NRGBA{R: next(), G: next(), B: next(), A: next()})
+			gray.SetGray(x, y, color.Gray{Y: next()})
+			nrgba64.SetNRGBA64(x, y, color.NRGBA64{R: uint16(next()) << 8, G: 0x1234, B: 0xfedc, A: uint16(next())<<8 | 0x7f})
+			paletted.SetColorIndex(x, y, next()%3)
+		}
+	}
+	for _, img := range []image.Image{rgba, nrgba, gray, nrgba64, ycbcr, paletted, nrgba.SubImage(image.Rect(5, 6, 9, 12))} {
+		got := referencePixels(img)
+		b := img.Bounds()
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				want := color.NRGBAModel.Convert(img.At(x, y)).(color.NRGBA)
+				i := 4 * ((y-b.Min.Y)*b.Dx() + (x - b.Min.X))
+				if c := (color.NRGBA{R: got[i], G: got[i+1], B: got[i+2], A: got[i+3]}); c != want {
+					t.Fatalf("%T pixel (%d,%d): got %v, want %v", img, x, y, c, want)
+				}
+			}
+		}
+	}
+}
+
 func TestLosslessPreserves16BitPixels(t *testing.T) {
 	src := image.NewNRGBA64(image.Rect(0, 0, 64, 64))
 	for y := 0; y < 64; y++ {

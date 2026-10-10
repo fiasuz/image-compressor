@@ -13,14 +13,19 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"runtime"
+	"slices"
 	"sort"
+	"sync"
+	"sync/atomic"
 )
 
 // Options controls PNG and JPEG compression. The zero value selects manual
 // lossy compression; set Smart or Lossless explicitly to use those modes.
 type Options struct {
 	// Smart tries several palette sizes and keeps the smallest result whose
-	// pixel PSNR is at least MinPSNR. Avoid enabling Smart and Lossless together.
+	// pixel PSNR is at least MinPSNR. Candidates run on up to GOMAXPROCS
+	// goroutines. Avoid enabling Smart and Lossless together.
 	Smart bool
 	// MinPSNR is the minimum quality for Smart mode. Zero uses 37 dB, a
 	// default. PSNR is a pixel metric, not a guarantee of visual equivalence.
@@ -46,6 +51,29 @@ type sample struct {
 type bucket struct {
 	colors []sample
 	weight int
+	// channel and spread describe the widest channel, cached because bucket
+	// selection reads them on every split.
+	channel, spread int
+}
+
+// histogram holds the unique colors of an image, sorted by rgbaKey, and the
+// index of every pixel's color, so palettes can be built, measured, and
+// applied without rescanning the pixels.
+type histogram struct {
+	img     *image.NRGBA
+	samples []sample
+	pixels  []uint32
+}
+
+// paletteSearch finds nearest palette entries without a full scan. Entries
+// are ordered by their projection onto (1, 1, 1, 2), which matches the
+// distance weights: by Cauchy-Schwarz, (Δr+Δg+Δb+2Δa)² ≤ 5·distance, so once
+// the projected gap alone exceeds the best distance, no further entry in that
+// direction can win.
+type paletteSearch struct {
+	colors []color.NRGBA
+	order  []uint8
+	keys   []int
 }
 
 // CompressPNG optimizes a PNG. Lossless mode preserves every decoded pixel.
@@ -151,9 +179,11 @@ func compressJPEGBytes(dst io.Writer, original []byte, img image.Image, opts Opt
 	if minPSNR < 20 || minPSNR > 60 {
 		return errors.New("minimum PSNR must be between 20 and 60 dB")
 	}
-	best := original
-	for _, quality := range []int{95, 92, 90, 88, 85, 82, 80, 78, 75, 72, 70, 68, 65, 60, 55, 50, 45, 40} {
-		encoded, err := encodeJPEG(img, quality)
+	reference := referencePixels(img)
+	qualities := []int{95, 92, 90, 88, 85, 82, 80, 78, 75, 72, 70, 68, 65, 60, 55, 50, 45, 40}
+	passing := make([][]byte, len(qualities))
+	err := forEach(len(qualities), func(i int) error {
+		encoded, err := encodeJPEG(img, qualities[i])
 		if err != nil {
 			return err
 		}
@@ -161,11 +191,15 @@ func compressJPEGBytes(dst io.Writer, original []byte, img image.Image, opts Opt
 		if err != nil {
 			return err
 		}
-		if pixelPSNR(img, candidate) >= minPSNR && len(encoded) < len(best) {
-			best = encoded
+		if sameSize(img, candidate) && psnr(squaredError(reference, candidate), len(reference)) >= minPSNR {
+			passing[i] = encoded
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
-	_, err := dst.Write(best)
+	_, err = dst.Write(smallest(original, passing))
 	return err
 }
 
@@ -186,27 +220,79 @@ func compressSmart(dst io.Writer, original []byte, src image.Image, opts Options
 		return errors.New("minimum PSNR must be between 20 and 60 dB")
 	}
 
-	best := original
+	h := newHistogram(toNRGBA(src))
+	// PSNR is measured against the decoded input. When its 8-bit form matches
+	// the quantizer's input, which holds for everything except some paletted
+	// images, the error can be summed per unique color instead of per pixel.
+	reference := referencePixels(src)
+	perColor := bytes.Equal(reference, h.img.Pix)
+	if perColor {
+		reference = nil
+	}
+
 	// Testing every candidate is intentional: median-cut quality is not
 	// perfectly monotonic as bucket boundaries move.
-	for _, colors := range []int{256, 192, 160, 128, 96, 80, 64, 48, 32, 24, 16} {
-		candidate, err := Quantize(src, Options{Colors: colors})
+	sizes := []int{256, 192, 160, 128, 96, 80, 64, 48, 32, 24, 16}
+	passing := make([][]byte, len(sizes))
+	err := forEach(len(sizes), func(i int) error {
+		palette := h.palette(sizes[i])
+		nearest := h.nearest(palette)
+		var squared uint64
+		if perColor {
+			squared = h.colorError(palette, nearest)
+		} else {
+			squared = h.pixelError(reference, palette, nearest)
+		}
+		if psnr(squared, len(h.img.Pix)) < minPSNR {
+			return nil
+		}
+		encoded, err := encodePNG(h.apply(palette, nearest))
 		if err != nil {
 			return err
 		}
-		if pixelPSNR(src, candidate) < minPSNR {
-			continue
-		}
-		encoded, err := encodePNG(candidate)
-		if err != nil {
-			return err
-		}
-		if len(encoded) < len(best) {
-			best = encoded
+		passing[i] = encoded
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	_, err = dst.Write(smallest(original, passing))
+	return err
+}
+
+// smallest returns the first strictly smaller candidate in order, or original.
+func smallest(original []byte, candidates [][]byte) []byte {
+	best := original
+	for _, candidate := range candidates {
+		if candidate != nil && len(candidate) < len(best) {
+			best = candidate
 		}
 	}
-	_, err := dst.Write(best)
-	return err
+	return best
+}
+
+// forEach calls f for 0 through n-1 on up to GOMAXPROCS goroutines and
+// returns the error with the lowest index.
+func forEach(n int, f func(int) error) error {
+	errs := make([]error, n)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < min(n, runtime.GOMAXPROCS(0)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int(next.Add(1) - 1); i < n; i = int(next.Add(1) - 1) {
+				errs[i] = f(i)
+			}
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func encodePNG(img image.Image) ([]byte, error) {
@@ -219,30 +305,111 @@ func encodePNG(img image.Image) ([]byte, error) {
 }
 
 func pixelPSNR(a, b image.Image) float64 {
-	bounds := a.Bounds()
-	if bounds.Dx() != b.Bounds().Dx() || bounds.Dy() != b.Bounds().Dy() {
+	if !sameSize(a, b) {
 		return 0
 	}
-	var squaredError float64
-	var samples int64
-	for y := 0; y < bounds.Dy(); y++ {
-		for x := 0; x < bounds.Dx(); x++ {
-			ca := color.NRGBAModel.Convert(a.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
-			cb := color.NRGBAModel.Convert(b.At(b.Bounds().Min.X+x, b.Bounds().Min.Y+y)).(color.NRGBA)
-			for _, d := range []int{
-				int(ca.R) - int(cb.R), int(ca.G) - int(cb.G),
-				int(ca.B) - int(cb.B), int(ca.A) - int(cb.A),
-			} {
-				squaredError += float64(d * d)
-				samples++
-			}
-		}
-	}
+	reference := referencePixels(a)
+	return psnr(squaredError(reference, b), len(reference))
+}
+
+func sameSize(a, b image.Image) bool {
+	return a.Bounds().Dx() == b.Bounds().Dx() && a.Bounds().Dy() == b.Bounds().Dy()
+}
+
+func psnr(squaredError uint64, samples int) float64 {
 	if squaredError == 0 {
 		return math.Inf(1)
 	}
-	mse := squaredError / float64(samples)
+	mse := float64(squaredError) / float64(samples)
 	return 10 * math.Log10(255*255/mse)
+}
+
+// referencePixels returns img as 8-bit NRGBA samples in row-major order,
+// converted exactly as color.NRGBAModel converts each pixel.
+func referencePixels(img image.Image) []uint8 {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if n, ok := img.(*image.NRGBA); ok && n.Stride == 4*w {
+		start := n.PixOffset(b.Min.X, b.Min.Y)
+		return n.Pix[start : start+4*w*h]
+	}
+	pix := make([]uint8, 4*w*h)
+	for y := 0; y < h; y++ {
+		nrgbaRow(img, y, pix[4*w*y:4*w*(y+1)])
+	}
+	return pix
+}
+
+// squaredError sums the squared sample differences between reference, as
+// returned by referencePixels, and img.
+func squaredError(reference []uint8, img image.Image) uint64 {
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	row := make([]uint8, 4*w)
+	var sum uint64
+	for y := 0; y < h; y++ {
+		nrgbaRow(img, y, row)
+		for i, v := range row {
+			d := int(reference[4*w*y+i]) - int(v)
+			sum += uint64(d * d)
+		}
+	}
+	return sum
+}
+
+// nrgbaRow writes row y of img, counted from its bounds, to row. Fast paths
+// cover the types the PNG and JPEG decoders return; each matches
+// color.NRGBAModel exactly.
+func nrgbaRow(img image.Image, y int, row []uint8) {
+	b := img.Bounds()
+	w := b.Dx()
+	switch img := img.(type) {
+	case *image.NRGBA:
+		start := img.PixOffset(b.Min.X, b.Min.Y+y)
+		copy(row, img.Pix[start:start+4*w])
+	case *image.RGBA:
+		for x := 0; x < w; x++ {
+			r, g, bl, a := img.RGBAAt(b.Min.X+x, b.Min.Y+y).RGBA()
+			putNRGBA(row[4*x:], r, g, bl, a)
+		}
+	case *image.YCbCr:
+		for x := 0; x < w; x++ {
+			r, g, bl, a := img.YCbCrAt(b.Min.X+x, b.Min.Y+y).RGBA()
+			putNRGBA(row[4*x:], r, g, bl, a)
+		}
+	case *image.Gray:
+		for x := 0; x < w; x++ {
+			v := img.GrayAt(b.Min.X+x, b.Min.Y+y).Y
+			row[4*x], row[4*x+1], row[4*x+2], row[4*x+3] = v, v, v, 0xff
+		}
+	default:
+		for x := 0; x < w; x++ {
+			c := color.NRGBAModel.Convert(img.At(b.Min.X+x, b.Min.Y+y)).(color.NRGBA)
+			row[4*x], row[4*x+1], row[4*x+2], row[4*x+3] = c.R, c.G, c.B, c.A
+		}
+	}
+}
+
+// putNRGBA converts alpha-premultiplied 16-bit channels the way
+// color.NRGBAModel does for colors that are not already color.NRGBA.
+func putNRGBA(dst []uint8, r, g, b, a uint32) {
+	switch a {
+	case 0xffff:
+		dst[0], dst[1], dst[2], dst[3] = uint8(r>>8), uint8(g>>8), uint8(b>>8), 0xff
+	case 0:
+		dst[0], dst[1], dst[2], dst[3] = 0, 0, 0, 0
+	default:
+		r = (r * 0xffff) / a
+		g = (g * 0xffff) / a
+		b = (b * 0xffff) / a
+		dst[0], dst[1], dst[2], dst[3] = uint8(r>>8), uint8(g>>8), uint8(b>>8), uint8(a>>8)
+	}
+}
+
+func toNRGBA(src image.Image) *image.NRGBA {
+	bounds := src.Bounds()
+	nrgba := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(nrgba, nrgba.Bounds(), src, bounds.Min, draw.Src)
+	return nrgba
 }
 
 func exactPalette(src image.Image, limit int) (*image.Paletted, bool) {
@@ -251,9 +418,7 @@ func exactPalette(src image.Image, limit int) (*image.Paletted, bool) {
 	case *image.Gray16, *image.RGBA64, *image.NRGBA64:
 		return nil, false
 	}
-	bounds := src.Bounds()
-	nrgba := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
-	draw.Draw(nrgba, nrgba.Bounds(), src, bounds.Min, draw.Src)
+	nrgba := toNRGBA(src)
 
 	indexes := make(map[uint32]uint8, limit)
 	palette := make(color.Palette, 0, limit)
@@ -296,47 +461,77 @@ func Quantize(src image.Image, opts Options) (*image.Paletted, error) {
 		return nil, errors.New("colors must be between 2 and 256")
 	}
 
-	bounds := src.Bounds()
-	nrgba := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
-	draw.Draw(nrgba, nrgba.Bounds(), src, bounds.Min, draw.Src)
-	palette := buildPalette(nrgba, opts.Colors)
-	out := image.NewPaletted(nrgba.Bounds(), palette)
+	h := newHistogram(toNRGBA(src))
+	palette := h.palette(opts.Colors)
 	if opts.Dither {
-		dither(out, nrgba)
-	} else {
-		mapNearest(out, nrgba)
+		out := image.NewPaletted(h.img.Bounds(), toPalette(palette))
+		dither(out, h.img, palette)
+		return out, nil
 	}
-	return out, nil
+	return h.apply(palette, h.nearest(palette)), nil
 }
 
-func buildPalette(img *image.NRGBA, limit int) color.Palette {
-	hist := make(map[uint32]int)
+func newHistogram(img *image.NRGBA) *histogram {
+	index := make(map[uint32]uint32)
+	var keys []uint32
+	var counts []int
+	pixels := make([]uint32, 0, img.Rect.Dx()*img.Rect.Dy())
 	for y := 0; y < img.Rect.Dy(); y++ {
 		for x := 0; x < img.Rect.Dx(); x++ {
 			i := img.PixOffset(x, y)
 			key := uint32(img.Pix[i])<<24 | uint32(img.Pix[i+1])<<16 |
 				uint32(img.Pix[i+2])<<8 | uint32(img.Pix[i+3])
-			hist[key]++
+			id, ok := index[key]
+			if !ok {
+				id = uint32(len(keys))
+				index[key] = id
+				keys = append(keys, key)
+				counts = append(counts, 0)
+			}
+			counts[id]++
+			pixels = append(pixels, id)
 		}
 	}
 
-	colors := make([]sample, 0, len(hist))
-	for key, count := range hist {
-		colors = append(colors, sample{
-			r: uint8(key >> 24), g: uint8(key >> 16),
-			b: uint8(key >> 8), a: uint8(key), count: count,
-		})
+	// Map iteration order is randomized in Go. Sorting by key establishes a
+	// stable secondary order so equal channel values always split the same way.
+	order := make([]uint32, len(keys))
+	for i := range order {
+		order[i] = uint32(i)
 	}
-	// Map iteration order is randomized in Go. Establish a stable secondary
-	// order so equal channel values always split the same way.
-	sort.Slice(colors, func(i, j int) bool {
-		return rgbaKey(colors[i]) < rgbaKey(colors[j])
-	})
-	if len(colors) <= limit {
-		return samplesToPalette(colors)
+	slices.SortFunc(order, func(a, b uint32) int { return cmpUint32(keys[a], keys[b]) })
+	rank := make([]uint32, len(keys))
+	samples := make([]sample, len(keys))
+	for i, id := range order {
+		rank[id] = uint32(i)
+		key := keys[id]
+		samples[i] = sample{r: uint8(key >> 24), g: uint8(key >> 16), b: uint8(key >> 8), a: uint8(key), count: counts[id]}
+	}
+	for i, id := range pixels {
+		pixels[i] = rank[id]
+	}
+	return &histogram{img: img, samples: samples, pixels: pixels}
+}
+
+func cmpUint32(a, b uint32) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	}
+	return 0
+}
+
+func (h *histogram) palette(limit int) []color.NRGBA {
+	if len(h.samples) <= limit {
+		return samplesToPalette(h.samples)
 	}
 
-	buckets := []bucket{{colors: colors, weight: totalWeight(colors)}}
+	// Median cut reorders bucket contents in place; work on a copy so the
+	// histogram can be shared between palette sizes.
+	colors := slices.Clone(h.samples)
+	buckets := []bucket{newBucket(colors, totalWeight(colors))}
 	for len(buckets) < limit {
 		idx := splittableBucket(buckets)
 		if idx < 0 {
@@ -347,19 +542,63 @@ func buildPalette(img *image.NRGBA, limit int) color.Palette {
 		buckets = append(buckets, right)
 	}
 
-	palette := make(color.Palette, 0, len(buckets))
+	palette := make([]color.NRGBA, 0, len(buckets))
 	for _, b := range buckets {
 		palette = append(palette, averageColor(b.colors))
 	}
-	return refinePalette(colors, palette, 8)
+	return refinePalette(h.samples, palette, 8)
 }
 
-func refinePalette(samples []sample, palette color.Palette, iterations int) color.Palette {
+// nearest returns the palette index for every unique color.
+func (h *histogram) nearest(palette []color.NRGBA) []uint8 {
+	search := newPaletteSearch(palette)
+	indexes := make([]uint8, len(h.samples))
+	for i, s := range h.samples {
+		indexes[i] = search.nearest(s.r, s.g, s.b, s.a)
+	}
+	return indexes
+}
+
+func (h *histogram) apply(palette []color.NRGBA, nearest []uint8) *image.Paletted {
+	out := image.NewPaletted(h.img.Bounds(), toPalette(palette))
+	for i, id := range h.pixels {
+		out.Pix[i] = nearest[id]
+	}
+	return out
+}
+
+// colorError is the squared error of mapping the image to palette, summed
+// once per unique color.
+func (h *histogram) colorError(palette []color.NRGBA, nearest []uint8) uint64 {
+	var sum uint64
+	for i, s := range h.samples {
+		c := palette[nearest[i]]
+		dr, dg, db, da := int(s.r)-int(c.R), int(s.g)-int(c.G), int(s.b)-int(c.B), int(s.a)-int(c.A)
+		sum += uint64(dr*dr+dg*dg+db*db+da*da) * uint64(s.count)
+	}
+	return sum
+}
+
+// pixelError is the squared error of mapping the image to palette, measured
+// against reference pixels from referencePixels.
+func (h *histogram) pixelError(reference []uint8, palette []color.NRGBA, nearest []uint8) uint64 {
+	var sum uint64
+	for i, id := range h.pixels {
+		c := palette[nearest[id]]
+		p := reference[4*i : 4*i+4]
+		dr, dg, db, da := int(p[0])-int(c.R), int(p[1])-int(c.G), int(p[2])-int(c.B), int(p[3])-int(c.A)
+		sum += uint64(dr*dr + dg*dg + db*db + da*da)
+	}
+	return sum
+}
+
+func refinePalette(samples []sample, palette []color.NRGBA, iterations int) []color.NRGBA {
 	for iteration := 0; iteration < iterations; iteration++ {
+		search := newPaletteSearch(palette)
 		type sum struct{ r, g, b, a, weight uint64 }
 		sums := make([]sum, len(palette))
 		for _, s := range samples {
-			idx := nearest(s.r, s.g, s.b, s.a, palette)
+			idx := search.nearest(s.r, s.g, s.b, s.a)
 			w := uint64(s.count)
 			sums[idx].r += uint64(s.r) * w
 			sums[idx].g += uint64(s.g) * w
@@ -376,7 +615,7 @@ func refinePalette(samples []sample, palette color.Palette, iterations int) colo
 				R: uint8(s.r / s.weight), G: uint8(s.g / s.weight),
 				B: uint8(s.b / s.weight), A: uint8(s.a / s.weight),
 			}
-			if color.NRGBAModel.Convert(palette[i]).(color.NRGBA) != updated {
+			if palette[i] != updated {
 				palette[i], changed = updated, true
 			}
 		}
@@ -387,14 +626,18 @@ func refinePalette(samples []sample, palette color.Palette, iterations int) colo
 	return palette
 }
 
-func rgbaKey(c sample) uint32 {
-	return uint32(c.r)<<24 | uint32(c.g)<<16 | uint32(c.b)<<8 | uint32(c.a)
-}
-
-func samplesToPalette(colors []sample) color.Palette {
-	p := make(color.Palette, 0, len(colors))
+func samplesToPalette(colors []sample) []color.NRGBA {
+	p := make([]color.NRGBA, 0, len(colors))
 	for _, c := range colors {
 		p = append(p, color.NRGBA{R: c.r, G: c.g, B: c.b, A: c.a})
+	}
+	return p
+}
+
+func toPalette(colors []color.NRGBA) color.Palette {
+	p := make(color.Palette, len(colors))
+	for i, c := range colors {
+		p[i] = c
 	}
 	return p
 }
@@ -407,18 +650,35 @@ func totalWeight(colors []sample) int {
 	return total
 }
 
-func channelRange(colors []sample, channel int) int {
-	min, max := 255, 0
+func channelValue(c sample, channel int) uint8 {
+	switch channel {
+	case 0:
+		return c.r
+	case 1:
+		return c.g
+	case 2:
+		return c.b
+	default:
+		return c.a
+	}
+}
+
+func newBucket(colors []sample, weight int) bucket {
+	var lo, hi [4]uint8
+	lo = [4]uint8{255, 255, 255, 255}
 	for _, c := range colors {
-		v := []uint8{c.r, c.g, c.b, c.a}[channel]
-		if int(v) < min {
-			min = int(v)
-		}
-		if int(v) > max {
-			max = int(v)
+		for ch, v := range [4]uint8{c.r, c.g, c.b, c.a} {
+			lo[ch] = min(lo[ch], v)
+			hi[ch] = max(hi[ch], v)
 		}
 	}
-	return max - min
+	b := bucket{colors: colors, weight: weight, spread: -1}
+	for ch := 0; ch < 4; ch++ {
+		if r := int(hi[ch]) - int(lo[ch]); r > b.spread {
+			b.channel, b.spread = ch, r
+		}
+	}
+	return b
 }
 
 func splittableBucket(buckets []bucket) int {
@@ -427,13 +687,7 @@ func splittableBucket(buckets []bucket) int {
 		if len(b.colors) < 2 {
 			continue
 		}
-		rangeMax := 0
-		for ch := 0; ch < 4; ch++ {
-			if r := channelRange(b.colors, ch); r > rangeMax {
-				rangeMax = r
-			}
-		}
-		candidate := rangeMax * b.weight
+		candidate := b.spread * b.weight
 		if candidate > score {
 			best, score = i, candidate
 		}
@@ -442,15 +696,8 @@ func splittableBucket(buckets []bucket) int {
 }
 
 func splitBucket(b bucket) (bucket, bucket) {
-	channel, widest := 0, -1
-	for ch := 0; ch < 4; ch++ {
-		if r := channelRange(b.colors, ch); r > widest {
-			channel, widest = ch, r
-		}
-	}
-	sort.SliceStable(b.colors, func(i, j int) bool {
-		a, z := b.colors[i], b.colors[j]
-		return []uint8{a.r, a.g, a.b, a.a}[channel] < []uint8{z.r, z.g, z.b, z.a}[channel]
+	slices.SortStableFunc(b.colors, func(x, y sample) int {
+		return int(channelValue(x, b.channel)) - int(channelValue(y, b.channel))
 	})
 
 	half, cumulative, cut := b.weight/2, 0, 1
@@ -461,12 +708,12 @@ func splitBucket(b bucket) (bucket, bucket) {
 			break
 		}
 	}
-	leftColors := append([]sample(nil), b.colors[:cut]...)
-	rightColors := append([]sample(nil), b.colors[cut:]...)
-	return bucket{leftColors, totalWeight(leftColors)}, bucket{rightColors, totalWeight(rightColors)}
+	left, right := b.colors[:cut:cut], b.colors[cut:]
+	leftWeight := totalWeight(left)
+	return newBucket(left, leftWeight), newBucket(right, b.weight-leftWeight)
 }
 
-func averageColor(colors []sample) color.Color {
+func averageColor(colors []sample) color.NRGBA {
 	var r, g, b, a, total uint64
 	for _, c := range colors {
 		w := uint64(c.count)
@@ -479,30 +726,54 @@ func averageColor(colors []sample) color.Color {
 	return color.NRGBA{uint8(r / total), uint8(g / total), uint8(b / total), uint8(a / total)}
 }
 
-func mapNearest(dst *image.Paletted, src *image.NRGBA) {
-	for y := 0; y < src.Rect.Dy(); y++ {
-		for x := 0; x < src.Rect.Dx(); x++ {
-			i := src.PixOffset(x, y)
-			dst.SetColorIndex(x, y, nearest(src.Pix[i], src.Pix[i+1], src.Pix[i+2], src.Pix[i+3], dst.Palette))
-		}
-	}
+func projection(r, g, b, a uint8) int {
+	return int(r) + int(g) + int(b) + 2*int(a)
 }
 
-func nearest(r, g, b, a uint8, palette color.Palette) uint8 {
-	best, bestDistance := 0, int64(1<<62)
-	for i, entry := range palette {
-		c := color.NRGBAModel.Convert(entry).(color.NRGBA)
-		dr, dg, db, da := int64(r)-int64(c.R), int64(g)-int64(c.G), int64(b)-int64(c.B), int64(a)-int64(c.A)
+func newPaletteSearch(palette []color.NRGBA) *paletteSearch {
+	order := make([]uint8, len(palette))
+	for i := range order {
+		order[i] = uint8(i)
+	}
+	key := func(i uint8) int { c := palette[i]; return projection(c.R, c.G, c.B, c.A) }
+	sort.Slice(order, func(i, j int) bool { return key(order[i]) < key(order[j]) })
+	keys := make([]int, len(order))
+	for i, idx := range order {
+		keys[i] = key(idx)
+	}
+	return &paletteSearch{colors: palette, order: order, keys: keys}
+}
+
+// nearest returns the index of the closest palette entry, preferring the
+// lowest index on ties, exactly as a linear scan would.
+func (p *paletteSearch) nearest(r, g, b, a uint8) uint8 {
+	key := projection(r, g, b, a)
+	start := sort.SearchInts(p.keys, key)
+	best, bestIndex := 1<<40, 0
+	check := func(i int) bool {
+		gap := p.keys[i] - key
+		if gap*gap > 5*best {
+			return false
+		}
+		idx := int(p.order[i])
+		c := p.colors[idx]
+		dr, dg, db, da := int(r)-int(c.R), int(g)-int(c.G), int(b)-int(c.B), int(a)-int(c.A)
 		// Alpha gets extra weight because mismatching transparency is conspicuous.
 		distance := dr*dr + dg*dg + db*db + 2*da*da
-		if distance < bestDistance {
-			best, bestDistance = i, distance
+		if distance < best || (distance == best && idx < bestIndex) {
+			best, bestIndex = distance, idx
 		}
+		return true
 	}
-	return uint8(best)
+	for i := start; i < len(p.keys) && check(i); i++ {
+	}
+	for i := start - 1; i >= 0 && check(i); i-- {
+	}
+	return uint8(bestIndex)
 }
 
-func dither(dst *image.Paletted, src *image.NRGBA) {
+func dither(dst *image.Paletted, src *image.NRGBA, palette []color.NRGBA) {
+	search := newPaletteSearch(palette)
 	w, h := src.Rect.Dx(), src.Rect.Dy()
 	current := make([][4]float64, w+2)
 	next := make([][4]float64, w+2)
@@ -522,9 +793,9 @@ func dither(dst *image.Paletted, src *image.NRGBA) {
 			g := clamp(float64(src.Pix[i+1]) + current[x+1][1])
 			b := clamp(float64(src.Pix[i+2]) + current[x+1][2])
 			a := src.Pix[i+3] // Do not diffuse alpha; it creates edge artifacts.
-			pi := nearest(r, g, b, a, dst.Palette)
+			pi := search.nearest(r, g, b, a)
 			dst.SetColorIndex(x, y, pi)
-			pc := color.NRGBAModel.Convert(dst.Palette[pi]).(color.NRGBA)
+			pc := palette[pi]
 			err := [4]float64{float64(r) - float64(pc.R), float64(g) - float64(pc.G), float64(b) - float64(pc.B), 0}
 			for ch := 0; ch < 3; ch++ {
 				current[x+2][ch] += err[ch] * 7 / 16

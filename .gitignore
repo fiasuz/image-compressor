@@ -1,5 +1,7 @@
 /imgcompress
 /imgcompress.exe
+/imgcompress-server
+/imgcompress-server.exe
 /bin/
 /dist/
 /coverage.out

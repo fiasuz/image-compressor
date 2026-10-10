@@ -1,0 +1,10 @@
+.git
+.github
+bin
+dist
+imgcompress
+imgcompress-server
+*.exe
+*.test
+coverage.out
+.DS_Store

@@ -10,6 +10,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         go: ['1.22.x', 'stable']
+        exclude:
+          # Go 1.22 omits LC_UUID, so -race test binaries abort on current macOS.
+          - os: macos-latest
+            go: '1.22.x'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
